@@ -1,0 +1,7 @@
+{
+  "installCommand": "echo 'Flutter is installed inside build.sh'",
+  "buildCommand": "bash build.sh",
+  "outputDirectory": "build/web",
+  "framework": null,
+  "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }]
+}
