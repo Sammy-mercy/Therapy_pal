@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import bcrypt from 'bcryptjs';
 import { z } from 'zod';
-import { get, run, newId, nowIso, tx } from '../lib/db.js';
+import { get, run, batch, stmt, newId, nowIso } from '../lib/db.js';
 import { HttpError, parse } from '../lib/http.js';
 import { requireAuth, signToken } from '../lib/auth.js';
 import { profileDto } from '../lib/dto.js';
@@ -30,28 +30,29 @@ const registerSchema = z.discriminatedUnion('role', [
   }),
 ]);
 
-r.post('/register', (req, res) => {
+r.post('/register', async (req, res) => {
   const d = parse(registerSchema, req.body);
-  if (get('SELECT id FROM users WHERE email = ?', d.email)) throw new HttpError(409, 'An account with this email already exists');
+  if (await get('SELECT id FROM users WHERE email = ?', d.email)) throw new HttpError(409, 'An account with this email already exists');
 
   const id = newId();
-  const hash = bcrypt.hashSync(d.password, 12);
-  tx(() => {
-    run(
+  const hash = await bcrypt.hash(d.password, 12); // async: does not freeze other requests while hashing
+  const writes = [
+    stmt(
       'INSERT INTO users (id, role, email, password_hash, name, phone, dob, created_at) VALUES (?,?,?,?,?,?,?,?)',
       id, d.role, d.email, hash, d.name, d.phone ?? '', d.dob ?? '', nowIso(),
-    );
-    if (d.role === 'clinician') {
-      run('INSERT INTO clinician_profiles (user_id, npi, specialization, license) VALUES (?,?,?,?)', id, d.npi, d.specialization, d.license);
-    } else {
-      const clinician = d.clinicianEmail
-        ? get("SELECT id FROM users WHERE email = ? AND role = 'clinician'", d.clinicianEmail)
-        : null;
-      if (d.clinicianEmail && !clinician) throw new HttpError(404, 'No clinician found with that email');
-      run('INSERT INTO patient_profiles (user_id, clinician_id, plan) VALUES (?,?,?)', id, clinician?.id ?? null, 'Care plan');
-    }
-  });
-  res.status(201).json({ token: signToken({ id, role: d.role }), user: profileDto(id) });
+    ),
+  ];
+  if (d.role === 'clinician') {
+    writes.push(stmt('INSERT INTO clinician_profiles (user_id, npi, specialization, license) VALUES (?,?,?,?)', id, d.npi, d.specialization, d.license));
+  } else {
+    const clinician = d.clinicianEmail
+      ? await get("SELECT id FROM users WHERE email = ? AND role = 'clinician'", d.clinicianEmail)
+      : null;
+    if (d.clinicianEmail && !clinician) throw new HttpError(404, 'No clinician found with that email');
+    writes.push(stmt('INSERT INTO patient_profiles (user_id, clinician_id, plan) VALUES (?,?,?)', id, clinician?.id ?? null, 'Care plan'));
+  }
+  await batch(writes); // all-or-nothing: a half-created account can never exist
+  res.status(201).json({ token: signToken({ id, role: d.role }), user: await profileDto(id) });
 });
 
 const loginSchema = z.object({
@@ -60,16 +61,16 @@ const loginSchema = z.object({
   role: z.enum(['patient', 'clinician']).optional(),
 });
 
-r.post('/login', (req, res) => {
+r.post('/login', async (req, res) => {
   const d = parse(loginSchema, req.body);
-  const user = get('SELECT * FROM users WHERE email = ?', d.email);
+  const user = await get('SELECT * FROM users WHERE email = ?', d.email);
   // Same message for unknown email and wrong password.
-  if (!user || !bcrypt.compareSync(d.password, user.password_hash)) throw new HttpError(401, 'Incorrect email or password');
+  if (!user || !(await bcrypt.compare(d.password, user.password_hash))) throw new HttpError(401, 'Incorrect email or password');
   if (d.role && d.role !== user.role) throw new HttpError(403, `This account is a ${user.role} account. Choose "${user.role}" to sign in.`);
-  res.json({ token: signToken(user), user: profileDto(user.id) });
+  res.json({ token: signToken(user), user: await profileDto(user.id) });
 });
 
-r.get('/me', requireAuth, (req, res) => res.json({ user: profileDto(req.user.id) }));
+r.get('/me', requireAuth, async (req, res) => res.json({ user: await profileDto(req.user.id) }));
 
 const updateSchema = z.object({
   name: z.string().trim().min(2, 'Enter your full name').max(100).optional(),
@@ -77,14 +78,14 @@ const updateSchema = z.object({
   phone: z.string().trim().max(40).optional(),
 });
 
-r.patch('/me', requireAuth, (req, res) => {
+r.patch('/me', requireAuth, async (req, res) => {
   const d = parse(updateSchema, req.body);
-  if (d.email && get('SELECT id FROM users WHERE email = ? AND id != ?', d.email, req.user.id)) {
+  if (d.email && (await get('SELECT id FROM users WHERE email = ? AND id != ?', d.email, req.user.id))) {
     throw new HttpError(409, 'That email is already in use');
   }
-  const cur = get('SELECT name, email, phone FROM users WHERE id = ?', req.user.id);
-  run('UPDATE users SET name = ?, email = ?, phone = ? WHERE id = ?', d.name ?? cur.name, d.email ?? cur.email, d.phone ?? cur.phone, req.user.id);
-  res.json({ user: profileDto(req.user.id) });
+  const cur = await get('SELECT name, email, phone FROM users WHERE id = ?', req.user.id);
+  await run('UPDATE users SET name = ?, email = ?, phone = ? WHERE id = ?', d.name ?? cur.name, d.email ?? cur.email, d.phone ?? cur.phone, req.user.id);
+  res.json({ user: await profileDto(req.user.id) });
 });
 
 const prefsSchema = z.object({
@@ -94,11 +95,11 @@ const prefsSchema = z.object({
   weeklySummary: z.boolean().optional(),
 });
 
-r.patch('/me/prefs', requireAuth, (req, res) => {
+r.patch('/me/prefs', requireAuth, async (req, res) => {
   const d = parse(prefsSchema, req.body);
-  const cur = JSON.parse(get('SELECT prefs FROM users WHERE id = ?', req.user.id).prefs);
-  run('UPDATE users SET prefs = ? WHERE id = ?', JSON.stringify({ ...cur, ...d }), req.user.id);
-  res.json({ user: profileDto(req.user.id) });
+  const cur = JSON.parse((await get('SELECT prefs FROM users WHERE id = ?', req.user.id)).prefs);
+  await run('UPDATE users SET prefs = ? WHERE id = ?', JSON.stringify({ ...cur, ...d }), req.user.id);
+  res.json({ user: await profileDto(req.user.id) });
 });
 
 export default r;

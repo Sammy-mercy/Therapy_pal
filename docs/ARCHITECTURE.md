@@ -4,7 +4,7 @@
 
 **How to read it:** technical terms are used on purpose (they are the words engineers use), and every time one appears it is followed by a plain-language explanation in parentheses. Example: "the app calls the API (the list of requests the server understands)".
 
-**Snapshot:** about 4,300 lines of Dart in `mobile/` (the Flutter app) and about 1,060 lines of JavaScript in `server/` (the Node.js server). Versions are those installed in October 2026.
+**Snapshot:** about 4,300 lines of Dart in `mobile/` (the Flutter app) and about 1,180 lines of JavaScript in `server/` (the Node.js server). Versions are those installed in October 2026.
 
 ---
 
@@ -16,10 +16,10 @@ Therapy Pal is a **client-server architecture** (a design where a program on the
  TIER 1: PRESENTATION              TIER 2: APPLICATION               TIER 3: DATA
  (what the user sees)              (the rules and logic)             (what is remembered)
 
- Flutter app  (mobile/)            Express server  (server/)         SQLite database file
- phone / tablet / laptop           Node.js, one process              server/data/therapy_pal.db
+ Flutter app  (mobile/)            Express server  (server/)         SQLite file (local) or Turso (hosted)
+ phone / tablet / laptop           Node.js; a Vercel Function online  server/data/therapy_pal.db (local)
         |                                 ^    |
-        |   HTTP + JSON over REST         |    +-- reads and writes -----> SQLite (same process)
+        |   HTTP + JSON over REST         |    +-- reads and writes -----> the database (over the network when hosted)
         +-------------------------------->|
           (requests and replies as plain text, in a standard web style)
 ```
@@ -83,10 +83,11 @@ Therapy_pal/
 | Fonts, dates, logo | `google_fonts`, `intl`, `flutter_svg` | Plus Jakarta Sans typeface, date formatting, the SVG (resolution-independent image) logo |
 | Server runtime | Node.js 22.13+ (tested on 24), ES modules | JavaScript on the server; ES modules (the modern `import`/`export` file system for code) |
 | Web framework | Express 5.2 | The most widely used Node framework; version 5 forwards errors from handlers (functions that answer a request) automatically |
-| Database | SQLite via Node's built-in `node:sqlite` | A whole database in one file (no separate database server to install or run) |
+| Database | SQLite-style SQL through `@libsql/client` (Turso) | One kind of SQL (the language databases understand) that runs on a plain local file in development and on a hosted Turso database when deployed |
 | Validation (checking that input is acceptable) | `zod` 4 | Describes the exact shape of acceptable input and rejects anything else |
 | Security packages | `helmet`, `cors`, `express-rate-limit`, `jsonwebtoken`, `bcryptjs` | Safer response headers (labels attached to a request or reply), cross-site rules, request caps, login passes, password scrambling |
 | Dev tooling | `nodemon` | Restarts the server when source files change (see section 10) |
+| Hosting | Vercel (two projects: the app and the server) + Turso (the database) | Free-to-start hosting where the app is a static website and the server runs as a serverless function (see section 4.11) |
 
 ---
 
@@ -100,7 +101,7 @@ A request travels through these layers in order. Each layer has one job.
 2. **Middleware pipeline** (a chain of checkpoints every request passes through before reaching real code).
 3. **Routers** (code that matches a web address to the right function; `routes/*.js`) contain the **handlers** (the functions that answer one kind of request).
 4. **Domain logic** (the business rules, here in `lib/adherence.js` and `lib/notify.js`) does the real thinking, such as deciding whether a dose was missed.
-5. **Data access** (`lib/db.js`, the only code that talks to the database) runs SQL (the language databases understand) with small helpers `get`, `all`, `run` and `tx`.
+5. **Data access** (`lib/db.js`, the only code that talks to the database) runs SQL (the language databases understand) with small helpers `get`, `all`, `run` and `batch`. All of them are **asynchronous** (the server carries on with other work while waiting for the database to answer), which a hosted database reached over the network requires.
 6. **DTO mapping** (`lib/dto.js`; DTO means "data transfer object", a reply shaped specifically for sending out) converts database rows into the tidy JSON (plain-text structured data) the app expects, for example `patient_id` becomes `patientId`.
 
 There is deliberately **no ORM** (a library that hides database commands behind objects). With nine tables, plain SQL (the language databases understand) is shorter and easier to read.
@@ -211,9 +212,30 @@ Settings live in **environment variables** (named settings kept outside the code
 | `JWT_SECRET` | Signing key for login passes. If empty in development a random temporary one is used (logins reset on restart); in production the server refuses to start without it |
 | `JWT_EXPIRES_IN` | Pass lifetime, default `7d` |
 | `PORT` | Default 4000 |
-| `DB_PATH` | Database file, default `./data/therapy_pal.db` |
+| `DB_PATH` | Local development database file, default `./data/therapy_pal.db` (used only when `TURSO_DATABASE_URL` is empty) |
+| `TURSO_DATABASE_URL` | Address of the hosted Turso database. Required in production: the server refuses to start without it, because a file on Vercel would be erased |
+| `TURSO_AUTH_TOKEN` | The password-like key that lets the server use that database |
 | `CORS_ORIGIN` | Allowed website origins, `*` for development |
 | `SEED_DEMO_DATA` | `true` loads demo data into an empty database at start |
+
+### 4.11 Running on Vercel (the hosting service)
+
+When deployed, the server is not a long-running program. Vercel runs the exported Express app as a **serverless function** (code that starts when a request arrives and may be stopped afterwards, so nothing can be kept in memory or on disk between requests).
+
+```
+ Browser or phone ---> Vercel project 1: the app   (static website built from mobile/)
+        |
+        +-----------> Vercel project 2: the server (Express as one Vercel Function, from server/)
+                              |
+                              +--> Turso: the hosted database (over the network)
+```
+
+- **Exported app, local listener.** `server.js` ends with `export default app` and only opens its own port when the `VERCEL` setting is absent, so the same file runs both ways.
+- **State lives in the database, not the server.** Accounts, regimens, doses and messages are all stored in Turso. Anything kept in a server copy's memory, such as rate-limit counters, belongs to that copy only.
+- **`trust proxy`** (a setting that makes the server read the visitor's real address from the host's forwarded label) is on, so login limits count per visitor rather than per Vercel machine.
+- **Two projects, two addresses.** The server's `CORS_ORIGIN` must list the app's address, and the app is built with `API_BASE_URL` set to the server's address (build-time settings are baked into the website).
+- **Safety guard.** In production the server refuses to start without `TURSO_DATABASE_URL`, and `npm run reset` refuses to wipe a hosted database unless `--confirm-remote` is added.
+- Step-by-step setup is in `docs/DEPLOYMENT.md`.
 
 ---
 
@@ -256,10 +278,10 @@ The **schema** (the blueprint of the database) has nine tables, created automati
 
 ### 5.3 Database behaviour
 
-- **WAL mode** (write-ahead logging: changes go to a side journal first, so readers are not blocked by writers) and `foreign_keys = ON` are set at startup.
+- **One client, two modes.** `@libsql/client` opens a local SQLite file in development and a hosted Turso database when `TURSO_DATABASE_URL` is set. Locally the server turns on `foreign_keys` (the rule that linked records must exist).
 - **Indexes** (lookup shortcuts that make searches fast) exist on regimens by patient, logs by patient and day, notifications by user and time, and messages by pair and time.
-- `tx()` wraps several changes in a **transaction** (a bundle of changes that all succeed or all roll back). Registration uses it so a half-created account can never exist.
-- `node:sqlite` is **synchronous** (each query finishes before the next line runs). For a small single-server app this is faster and simpler than asynchronous drivers, but it is one reason SQLite suits only modest traffic.
+- **Batches** (`batch()`: several changes sent together that all succeed or all fail) protect multi-step writes. Registration uses one so a half-created account can never exist, and seeding sends its demo data in a few large batches. Each separate query to a hosted database is a network round trip (a request and a reply across the internet), so related reads are started together with `Promise.all` (start several requests at once and wait for all of them).
+- **Tables are created on first use.** `ready()` (a function that makes sure the blueprint is in place) runs once per running copy of the server, in a single round trip, using `CREATE TABLE IF NOT EXISTS`.
 - **Seeding** (`seed.js`) builds demo data with a **deterministic pseudo-random generator** (a random-looking sequence that is identical every run for the same seed name), so every reset produces the same story. Demo data is generated relative to the day you run it, so it ages; run `npm run reset` to refresh.
 
 ---
@@ -435,8 +457,10 @@ Both sides post to `/messages/threads/:patientId`; the server stores the message
 
 | Decision | Alternatives considered | Why this one | Trade-off accepted |
 |---|---|---|---|
-| SQLite in one file | PostgreSQL, MongoDB | Zero setup, easy backup (copy a file), enough for one server | One writer at a time; will need PostgreSQL for many users or several servers |
-| `node:sqlite` built in | `better-sqlite3`, an ORM (a library that hides database commands behind objects) | No native compilation (building code for your specific machine) on Windows | Newer module; API (the server's list of requests it understands) may change |
+| SQLite-compatible database (libSQL): a local file in development, Turso when deployed | PostgreSQL, MongoDB, a plain SQLite file everywhere | The same SQL everywhere, so local work behaves like production; Vercel cannot keep a file (its disk is erased between requests) | Every query is a network trip when hosted, so the Vercel Function region and the Turso region should be close together |
+| `@libsql/client` (asynchronous driver) | `node:sqlite` (built in but synchronous and file-only), an ORM (a library that hides database commands behind objects) | One driver for both a local file and a hosted database | Every route handler is `async`; one extra dependency |
+| Two Vercel projects from one repository (app and server) | One project with rewrites (rules that forward addresses) | Each part builds and deploys on its own, and the app stays a simple static website | Two web addresses, so `CORS_ORIGIN` and `API_BASE_URL` must point at each other |
+| Server exports the Express app and only listens locally | Always calling `listen` | Vercel runs the exported app itself; locally `npm run dev` still works | A small check of the `VERCEL` setting in `server.js` |
 | Adherence derived, not stored | A nightly job writing "missed" rows | Always correct, no background job | Recomputed on each request |
 | JWT (stateless (the server remembers nothing between requests) pass) | Server-side sessions | Simple, works for web and mobile | Cannot revoke a pass before it expires |
 | Client sends its local day and time | Server computes "today" | Correct in any time zone | The server trusts the client's clock (a user could back-date their own doses) |
@@ -452,6 +476,7 @@ Both sides post to `/messages/threads/:patientId`; the server stores the message
 
 - **`node --watch` on Windows** restarted the server whenever a file was read after a long idle period, which dropped the first login request and showed up in the app as "can't reach the server". Replaced by `nodemon`.
 - **Running two server copies** on the same database can cause "disk I/O error" on SQLite's journal files. Run exactly one.
+- **A file database and a serverless host do not mix.** Vercel runs code in short-lived copies with an erasable disk, so a SQLite file would lose every record. The fix was a hosted database and an asynchronous data layer.
 - **A navigation bar inside a Flutter `Scaffold` slot** that used a `Column` without `mainAxisSize: min` (a setting that makes a column only as tall as its contents) expanded to the full screen and hid every page. Widget tests (tests that draw real screens in a simulated window) that render real screens are what caught it.
 
 ---
@@ -470,7 +495,7 @@ Ordered by value for effort.
 8. **Pagination** (loading long lists in pages) for logs, messages and patients, and **batching** the per-patient adherence queries.
 9. **Production hardening:** HTTPS (the secure, scrambled version of web traffic) only, remove the development network exceptions, strong `JWT_SECRET`, tighter CORS (a browser rule about which websites may call the server) origins, and server-side clock checks on logged doses.
 10. **Health-data governance.** Before real patients use it, plan for encryption (scrambling data so only the right party can read it) at rest (scrambling stored data), audit logging (a tamper-resistant record of who accessed what), consent flows, backups, and a review against the health-privacy rules that apply where it is deployed. None of these exist yet, and the app should not be described as compliant with any health-privacy standard.
-11. **Move to PostgreSQL** if you need more than one server or many simultaneous users.
+11. **Scale the database and shared limits.** If one Turso database cannot keep up with many simultaneous users, upgrade its plan or move to PostgreSQL. Also move the login rate-limit counters to a shared store: they are currently kept in each running copy's memory, so on Vercel they are only approximate.
 12. **Optional offline support** (a local cache (a saved copy kept for quick reuse) so the app shows the last known data without a connection).
 
 ---
@@ -495,3 +520,5 @@ cd ../server; powershell -File .\test-api.ps1   # needs the server running
 ```
 
 Demo accounts (password `therapy-pal`): `alex.rivera@email.com` (patient) and `s.carter@downtownclinic.org` (clinician).
+
+Deploying online (Vercel + Turso): follow `docs/DEPLOYMENT.md`.

@@ -19,7 +19,7 @@ const expiresIn = process.env.JWT_EXPIRES_IN || '7d';
 
 export const signToken = (user) => jwt.sign({ sub: user.id, role: user.role }, secret, { expiresIn });
 
-export function requireAuth(req, _res, next) {
+export async function requireAuth(req, _res, next) {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
   if (!token) throw new HttpError(401, 'Sign in to continue');
@@ -29,7 +29,7 @@ export function requireAuth(req, _res, next) {
   } catch {
     throw new HttpError(401, 'Your session has expired. Please sign in again.');
   }
-  const user = get('SELECT id, role, email, name FROM users WHERE id = ?', payload.sub);
+  const user = await get('SELECT id, role, email, name FROM users WHERE id = ?', payload.sub);
   if (!user) throw new HttpError(401, 'Account no longer exists');
   req.user = user;
   next();

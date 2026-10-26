@@ -9,3 +9,4 @@ server/*.log
 server/out.txt
 server/err.txt
 .DS_Store
+.vercel

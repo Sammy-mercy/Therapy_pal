@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { all, get, run, newId } from '../lib/db.js';
 import { HttpError, parse, clientNow, notFound } from '../lib/http.js';
 import { requireAuth, requireRole } from '../lib/auth.js';
-import { initials, regimenDto } from '../lib/dto.js';
+import { initials, regimenDtos } from '../lib/dto.js';
 import { notify } from '../lib/notify.js';
 import { addDays, adherenceFor, buildSlots, missedByPeriod, summarize, weeklyTrend } from '../lib/adherence.js';
 import { regimenInput, insertRegimen } from './patient.js';
@@ -17,8 +17,8 @@ function ageFrom(dob) {
   return Math.floor((Date.now() - t) / (365.25 * 24 * 3600 * 1000));
 }
 
-function ownPatient(clinicianId, patientId) {
-  const p = get(
+async function ownPatient(clinicianId, patientId) {
+  const p = await get(
     `SELECT u.id, u.name, u.email, u.phone, u.dob, u.created_at, p.plan, p.note
      FROM users u JOIN patient_profiles p ON p.user_id = u.id
      WHERE u.id = ? AND p.clinician_id = ?`,
@@ -28,11 +28,13 @@ function ownPatient(clinicianId, patientId) {
   return p;
 }
 
-function patientSummary(p, now, clinicianId) {
-  const { rate, missed } = adherenceFor(p.id, now, 30);
-  const regimens = all('SELECT name, strength FROM regimens WHERE patient_id = ? AND active = 1 ORDER BY started', p.id);
-  const last = get('SELECT day, logged_time, created_at FROM dose_logs WHERE patient_id = ? ORDER BY created_at DESC LIMIT 1', p.id);
-  const unread = get('SELECT COUNT(*) AS n FROM messages WHERE patient_id = ? AND clinician_id = ? AND sender_id = patient_id AND read = 0', p.id, clinicianId);
+async function patientSummary(p, now, clinicianId) {
+  const [{ rate, missed }, regimens, last, unread] = await Promise.all([
+    adherenceFor(p.id, now, 30),
+    all('SELECT name, strength FROM regimens WHERE patient_id = ? AND active = 1 ORDER BY started', p.id),
+    get('SELECT day, logged_time, created_at FROM dose_logs WHERE patient_id = ? ORDER BY created_at DESC LIMIT 1', p.id),
+    get('SELECT COUNT(*) AS n FROM messages WHERE patient_id = ? AND clinician_id = ? AND sender_id = patient_id AND read = 0', p.id, clinicianId),
+  ]);
   return {
     id: p.id, name: p.name, initials: initials(p.name), note: p.note, age: ageFrom(p.dob),
     since: p.created_at, rate, missed,
@@ -42,14 +44,14 @@ function patientSummary(p, now, clinicianId) {
   };
 }
 
-r.get('/patients', (req, res) => {
+r.get('/patients', async (req, res) => {
   const now = clientNow(req.query);
-  const rows = all(
+  const rows = await all(
     `SELECT u.id, u.name, u.dob, u.created_at, p.note FROM users u
      JOIN patient_profiles p ON p.user_id = u.id WHERE p.clinician_id = ? ORDER BY u.name`,
     req.user.id,
   );
-  const patients = rows.map((p) => patientSummary(p, now, req.user.id));
+  const patients = await Promise.all(rows.map((p) => patientSummary(p, now, req.user.id)));
   const rated = patients.filter((p) => p.rate !== null);
   res.json({
     patients,
@@ -61,21 +63,26 @@ r.get('/patients', (req, res) => {
   });
 });
 
-r.get('/patients/:id', (req, res) => {
+r.get('/patients/:id', async (req, res) => {
   const now = clientNow(req.query);
-  const p = ownPatient(req.user.id, req.params.id);
+  const p = await ownPatient(req.user.id, req.params.id);
+  const [summary, regimenRows, history] = await Promise.all([
+    patientSummary(p, now, req.user.id),
+    all('SELECT * FROM regimens WHERE patient_id = ? ORDER BY active DESC, started DESC', p.id),
+    all('SELECT id, date, title, detail, place FROM history WHERE patient_id = ? ORDER BY date DESC', p.id),
+  ]);
   res.json({
-    patient: { ...patientSummary(p, now, req.user.id), email: p.email, phone: p.phone, dob: p.dob },
-    regimens: all('SELECT * FROM regimens WHERE patient_id = ? ORDER BY active DESC, started DESC', p.id).map(regimenDto),
-    history: all('SELECT id, date, title, detail, place FROM history WHERE patient_id = ? ORDER BY date DESC', p.id),
+    patient: { ...summary, email: p.email, phone: p.phone, dob: p.dob },
+    regimens: await regimenDtos(regimenRows),
+    history,
   });
 });
 
-r.post('/patients/:id/regimens', (req, res) => {
+r.post('/patients/:id/regimens', async (req, res) => {
   const d = parse(regimenInput, req.body);
-  const p = ownPatient(req.user.id, req.params.id);
-  const regimen = insertRegimen(p.id, req.user.id, d);
-  notify(p.id, 'regimen', `New regimen assigned by ${req.user.name}`, `${regimen.name} added to your plan.`);
+  const p = await ownPatient(req.user.id, req.params.id);
+  const regimen = await insertRegimen(p.id, req.user.id, d);
+  await notify(p.id, 'regimen', `New regimen assigned by ${req.user.name}`, `${regimen.name} added to your plan.`);
   res.status(201).json({ regimen });
 });
 
@@ -86,38 +93,39 @@ const historyInput = z.object({
   place: z.string().trim().max(120).optional().default(''),
 });
 
-r.post('/patients/:id/history', (req, res) => {
+r.post('/patients/:id/history', async (req, res) => {
   const d = parse(historyInput, req.body);
-  const p = ownPatient(req.user.id, req.params.id);
+  const p = await ownPatient(req.user.id, req.params.id);
   const id = newId();
-  run('INSERT INTO history (id, patient_id, date, title, detail, place) VALUES (?,?,?,?,?,?)', id, p.id, d.date, d.title, d.detail, d.place);
+  await run('INSERT INTO history (id, patient_id, date, title, detail, place) VALUES (?,?,?,?,?,?)', id, p.id, d.date, d.title, d.detail, d.place);
   res.status(201).json({ record: { id, ...d } });
 });
 
 const linkSchema = z.object({ email: z.string().trim().toLowerCase().pipe(z.email('Enter a valid email address')) });
 
 /** Add an existing patient account to this clinician's panel. */
-r.post('/patients/link', (req, res) => {
+r.post('/patients/link', async (req, res) => {
   const { email } = parse(linkSchema, req.body);
-  const p = get("SELECT u.id, p.clinician_id FROM users u JOIN patient_profiles p ON p.user_id = u.id WHERE u.email = ? AND u.role = 'patient'", email);
+  const p = await get("SELECT u.id, p.clinician_id FROM users u JOIN patient_profiles p ON p.user_id = u.id WHERE u.email = ? AND u.role = 'patient'", email);
   if (!p) throw notFound('No patient account found with that email');
   if (p.clinician_id && p.clinician_id !== req.user.id) throw new HttpError(409, 'That patient is already assigned to another clinician');
-  run('UPDATE patient_profiles SET clinician_id = ? WHERE user_id = ?', req.user.id, p.id);
+  await run('UPDATE patient_profiles SET clinician_id = ? WHERE user_id = ?', req.user.id, p.id);
   res.status(201).json({ ok: true, patientId: p.id });
 });
 
-r.get('/analytics', (req, res) => {
+r.get('/analytics', async (req, res) => {
   const now = clientNow(req.query);
-  const rows = all(
+  const rows = await all(
     'SELECT u.id, u.name FROM users u JOIN patient_profiles p ON p.user_id = u.id WHERE p.clinician_id = ? ORDER BY u.name',
     req.user.id,
   );
   const from56 = addDays(now.day, -55);
   const from30 = addDays(now.day, -29);
+  const perPatient = await Promise.all(rows.map((p) => buildSlots(p.id, from56, now.day, now)));
   let panel56 = [];
   let panel30 = [];
-  const byPatient = rows.map((p) => {
-    const s56 = buildSlots(p.id, from56, now.day, now);
+  const byPatient = rows.map((p, i) => {
+    const s56 = perPatient[i];
     const s30 = s56.filter((s) => s.day >= from30);
     panel56 = panel56.concat(s56);
     panel30 = panel30.concat(s30);

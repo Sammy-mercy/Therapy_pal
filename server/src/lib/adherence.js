@@ -21,12 +21,14 @@ export function eachDay(from, to) {
  * Expand every active regimen into concrete dose slots for [fromDay, toDay]
  * and resolve each to taken | missed | due | upcoming using the client's "now".
  */
-export function buildSlots(patientId, fromDay, toDay, now) {
-  const regimens = all('SELECT * FROM regimens WHERE patient_id = ? AND active = 1', patientId);
-  const logs = all(
-    'SELECT regimen_id, day, slot, logged_time FROM dose_logs WHERE patient_id = ? AND day BETWEEN ? AND ?',
-    patientId, fromDay, toDay,
-  );
+export async function buildSlots(patientId, fromDay, toDay, now) {
+  const [regimens, logs] = await Promise.all([
+    all('SELECT * FROM regimens WHERE patient_id = ? AND active = 1', patientId),
+    all(
+      'SELECT regimen_id, day, slot, logged_time FROM dose_logs WHERE patient_id = ? AND day BETWEEN ? AND ?',
+      patientId, fromDay, toDay,
+    ),
+  ]);
   const logged = new Map(logs.map((l) => [`${l.regimen_id}|${l.day}|${l.slot}`, l.logged_time]));
   const nowMin = toMin(now.time);
   const slots = [];
@@ -105,8 +107,8 @@ export function streakDays(slots, nowDay) {
   return streak;
 }
 
-export function adherenceFor(patientId, now, days = 30) {
+export async function adherenceFor(patientId, now, days = 30) {
   const from = addDays(now.day, -(days - 1));
-  const slots = buildSlots(patientId, from, now.day, now);
+  const slots = await buildSlots(patientId, from, now.day, now);
   return { slots, ...summarize(slots) };
 }

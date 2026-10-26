@@ -3,8 +3,12 @@
 A dual-role (patient + clinician) treatment regimen app.
 
 - `mobile/` - Flutter app (Android, iOS, web). Patient and clinician experiences share one login.
-- `server/` - Node.js + Express 5 API with SQLite (Node's built-in `node:sqlite`, no native build step).
-- `docs/` - put design exports and notes here.
+- `server/` - Node.js + Express 5 API. Data uses SQLite-style storage through `@libsql/client`: a local file in development, a hosted Turso database when deployed.
+- `docs/` - `ARCHITECTURE.md` (how it is built) and `DEPLOYMENT.md` (how to put it online).
+
+## Put it online
+
+See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md): the server and the app each become a Vercel project, and the database moves to Turso.
 
 ## Run it
 
@@ -33,8 +37,9 @@ Demo data is generated relative to the day you seed it. If it looks stale after 
 
 | File | Variable | Purpose |
 |---|---|---|
-| `server/.env.local` | `JWT_SECRET` | **Set before production.** Empty = temporary dev secret, logins reset on restart |
-| | `PORT`, `DB_PATH`, `CORS_ORIGIN` | Server port, SQLite file, allowed web origins (`*` for dev only) |
+| `server/.env.local` | `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN` | Hosted database. Leave empty locally (a file is used); required online (set them in Vercel) |
+| | `JWT_SECRET` | **Set before production.** Empty = temporary dev secret, logins reset on restart |
+| | `PORT`, `DB_PATH`, `CORS_ORIGIN` | Server port, local database file, allowed web origins (`*` for dev only) |
 | | `SEED_DEMO_DATA` | `true` loads demo data into an empty database on first start; set `false` for real use |
 | `mobile/.env.local` | `API_BASE_URL` | Empty = emulator/localhost defaults. Physical phone: `http://<your-LAN-IP>:4000/api` |
 
